@@ -1,0 +1,423 @@
+---
+Run other programs: wait for them and capture their output, or start
+them and talk to them over pipes.
+
+Run to completion:
+  `process.run(args, ...)`    — run, wait, return a `RunResult` (exit code,
+                                stdout, stderr)
+  `process.shell(command)`    — the same through `/bin/sh -c`
+  `process.output(args)`      — just stdout (trailing newline removed);
+                                throws `ProcessError` on a non-zero exit
+
+Run alongside:
+  `process.spawn(args, ...)`  — start it, return a `Process` to write to,
+                                read from, wait for or kill
+
+`args` is the program and its arguments as a List — `["git", "log",
+"-1"]` — passed to the program as-is, with no shell in between (no
+quoting to get wrong). The program is looked up on `PATH`. A program
+that can't be found throws `FileNotFoundError`.
+
+Options (`run`, `shell`, `spawn`):
+  `cwd`         — directory to run in ("" = this one)
+  `env`         — Map of variables added to (or replacing) this process's
+                  environment; with `inherit_env=false` they're all of it
+  `timeout_ms`  — `run` / `shell` / `communicate`: kill the program after
+                  this long (`RunResult.timed_out` is then true)
+  `check`       — `run` / `shell`: throw `ProcessError` on a non-zero exit
+
+Inside an `async` task, every wait lets the other tasks run, and
+`task.cancel()` kills the program and raises `CancelledError`.
+
+@example
+r := process.run(["git", "status", "--short"])
+if r.ok {
+    print(r.stdout)
+} else {
+    print("git failed:", r.stderr)
+}
+
+@example
+branch := process.output(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+
+@example
+r := process.run(["sort"], input="b\na\nc\n")
+print(r.stdout)            // "a\nb\nc\n"
+
+@example
+p := process.spawn(["python3", "-u", "worker.py"])
+p.write("job 1\n")
+print(p.read_line())
+p.close_stdin()
+code := p.wait()
+---
+from typing.primitives.string use { String }
+from typing.collections.list use { List }
+from typing.collections.map use { Map }
+from typing.exceptions.types use { IOError, FileNotFoundError, RuntimeError, ValueError }
+
+extern define spawn_raw(argv: List, cwd: String, env: List, inherit_env: Int, in_mode: Int, out_mode: Int, err_mode: Int) -> List
+extern define strerror(err: Int) -> String
+extern define wait_raw(pid: Int, timeout_ms: Int) -> Int
+extern define kill_raw(pid: Int, sig: Int) -> Int
+extern define close_raw(fd: Int) -> void
+extern define read_raw(fd: Int, max: Int) -> String
+extern define read_line_raw(fd: Int) -> List
+extern define write_raw(fd: Int, data: String) -> Int
+extern define communicate_raw(pid: Int, in_fd: Int, out_fd: Int, err_fd: Int, input: String, timeout_ms: Int) -> List
+
+--- This process's id. ---
+extern define pid() -> Int
+
+// wait_raw / communicate_raw: still running (a wait that timed out).
+_RUNNING := -1000
+_ENOENT := 2
+
+---
+Thrown by `run(check=true)`, `shell(check=true)` and `output` when the
+program exits with a non-zero code. The message names the command, the
+exit code and the first line of its stderr.
+---
+struct ProcessError : RuntimeError {
+    define __init(self, message: String) -> void {
+        super().__init(message)
+    }
+}
+
+---
+A finished program.
+  `args`       — what was run
+  `code`       — exit code; `-N` when it was killed by signal N
+  `stdout`     — everything it wrote to stdout ("" when not captured)
+  `stderr`     — everything it wrote to stderr ("" when not captured or
+                 merged into stdout)
+  `timed_out`  — killed because `timeout_ms` passed
+  `ok`         — `code == 0`
+---
+struct RunResult {
+    args: List
+    code: Int
+    stdout: String
+    stderr: String
+    timed_out: Bool
+    ok: Bool
+
+    define __init(self, args: List, code: Int, stdout: String, stderr: String, timed_out: Bool) -> void {
+        self.args = args
+        self.code = code
+        self.stdout = stdout
+        self.stderr = stderr
+        self.timed_out = timed_out
+        self.ok = code == 0
+    }
+
+    --- Throw `ProcessError` unless the program exited with code 0. ---
+    define check(self) -> void {
+        if self.code != 0 {
+            throw ProcessError(_failure_message(self.args, self.code, self.stderr, self.timed_out))
+        }
+    }
+
+    define __str(self) -> String {
+        return "RunResult(code=" + self.code.str() + ", stdout=" + self.stdout.length().str()
+            + " chars, stderr=" + self.stderr.length().str() + " chars)"
+    }
+}
+
+define _join_args(args: List) -> String {
+    out := ""
+    for a in args {
+        word: String = a.str()
+        if out.length() > 0 { out = out + " " }
+        if word.length() == 0 or word.contains(" ") { out = out + "'" + word + "'" } else { out = out + word }
+    }
+    return out
+}
+
+define _failure_message(args: List, code: Int, stderr: String, timed_out: Bool) -> String {
+    msg := "'" + _join_args(args) + "'"
+    if timed_out {
+        msg = msg + " timed out"
+    } elif code < 0 {
+        msg = msg + " was killed by signal " + (0 - code).str()
+    } else {
+        msg = msg + " exited with code " + code.str()
+    }
+    first := stderr.trim()
+    nl := first.find("\n")
+    if nl >= 0 { first = first.substring(0, nl) }
+    if first.length() > 0 { msg = msg + ": " + first }
+    return msg
+}
+
+define _mode(name: String, what: String, allow_stdout: Bool) -> Int {
+    if name == "inherit" { return 0 }
+    if name == "pipe" { return 1 }
+    if name == "null" { return 2 }
+    if allow_stdout and name == "stdout" { return 3 }
+    allowed := "\"pipe\", \"inherit\" or \"null\""
+    if allow_stdout { allowed = "\"pipe\", \"inherit\", \"null\" or \"stdout\"" }
+    throw ValueError("process: " + what + " must be " + allowed + ", not \"" + name + "\"")
+}
+
+define _env_list(env: Map) -> List {
+    out := []
+    for (k, v) in env {
+        key: String = k
+        val: String = v.str()
+        out.append(key + "=" + val)
+    }
+    return out
+}
+
+// Start the program; returns [pid, stdin_fd, stdout_fd, stderr_fd].
+define _start(args: List, cwd: String, env: Map, inherit_env: Bool, in_mode: Int, out_mode: Int, err_mode: Int) -> List {
+    if args.length() == 0 {
+        throw ValueError("process: args is empty — give the program to run, e.g. [\"ls\", \"-l\"]")
+    }
+    argv := []
+    for a in args { argv.append(a.str()) }
+    inherit := 0
+    if inherit_env { inherit = 1 }
+    r := spawn_raw(argv, cwd, _env_list(env), inherit, in_mode, out_mode, err_mode)
+    first: Int = r[0]
+    if first < 0 {
+        err: Int = r[1]
+        prog: String = argv[0]
+        if err == _ENOENT {
+            if cwd.length() > 0 and not prog.contains("/") {
+                throw FileNotFoundError("process: can't run '" + prog + "': not found on PATH (or no directory '" + cwd + "')")
+            }
+            throw FileNotFoundError("process: can't run '" + prog + "': no such file or directory")
+        }
+        throw IOError("process: can't run '" + prog + "': " + strerror(err))
+    }
+    return r
+}
+
+---
+A running program, from `process.spawn`.
+  `pid`   — its process id
+  `args`  — what was run
+  `code`  — exit code once it has finished (after `wait`, `done` or
+            `communicate`); -1 before
+---
+struct Process {
+    pid: Int
+    args: List
+    code: Int
+    _in: Int
+    _out: Int
+    _err: Int
+    _finished: Bool
+
+    define __init(self, args: List, pid: Int, in_fd: Int, out_fd: Int, err_fd: Int) -> void {
+        self.args = args
+        self.pid = pid
+        self._in = in_fd
+        self._out = out_fd
+        self._err = err_fd
+        self.code = -1
+        self._finished = false
+    }
+
+    --- Write `data` to the program's stdin. Throws `IOError` if stdin isn't a pipe or the program closed it. ---
+    define write(self, data: String) -> void {
+        if self._in < 0 { throw IOError("process: stdin isn't a pipe (spawn with stdin: \"pipe\")") }
+        if write_raw(self._in, data) < 0 {
+            throw IOError("process: writing to '" + _join_args(self.args) + "' failed (it closed its stdin?)")
+        }
+    }
+
+    --- Close the program's stdin, so it sees end of input. ---
+    define close_stdin(self) -> void {
+        if self._in >= 0 {
+            close_raw(self._in)
+            self._in = -1
+        }
+    }
+
+    --- Up to `size` bytes of stdout, waiting until some arrive. "" once it's all been read. ---
+    define read(self, size: Int = 65536) -> String {
+        if self._out < 0 { return "" }
+        return read_raw(self._out, size)
+    }
+
+    --- The next line of stdout, without its newline; null at the end of output. ---
+    define read_line(self) -> String {
+        if self._out < 0 { return null }
+        r := read_line_raw(self._out)
+        got: Int = r[1]
+        if got == 0 { return null }
+        line: String = r[0]
+        return line
+    }
+
+    --- Every remaining line of stdout. ---
+    define lines(self) -> List {
+        out := []
+        if self._out < 0 { return out }
+        while true {
+            r := read_line_raw(self._out)
+            got: Int = r[1]
+            if got == 0 { break }
+            out.append(r[0])
+        }
+        return out
+    }
+
+    --- Up to `size` bytes of stderr; "" once it's all been read. ---
+    define read_err(self, size: Int = 65536) -> String {
+        if self._err < 0 { return "" }
+        return read_raw(self._err, size)
+    }
+
+    ---
+    Send `input` to stdin (then close it), read stdout and stderr to the
+    end and wait for the program — all at once, so it can't stall on a
+    full pipe. With `timeout_ms`, the program is killed when it runs out.
+    ---
+    define communicate(self, input: String = "", timeout_ms: Int = -1) -> RunResult {
+        r := communicate_raw(self.pid, self._in, self._out, self._err, input, timeout_ms)
+        self._in = -1
+        self._out = -1
+        self._err = -1
+        code: Int = r[0]
+        timed: Int = r[3]
+        self.code = code
+        self._finished = true
+        return RunResult(self.args, code, r[1], r[2], timed != 0)
+    }
+
+    --- Wait for the program to finish; returns its exit code (`-N`: killed by signal N). ---
+    define wait(self) -> Int {
+        if not self._finished {
+            self.code = wait_raw(self.pid, -1)
+            self._finished = true
+            self._close_pipes()
+        }
+        return self.code
+    }
+
+    --- Wait up to `timeout_ms`; true if it finished (its code is then in `code`). ---
+    define wait_for(self, timeout_ms: Int) -> Bool {
+        if self._finished { return true }
+        c := wait_raw(self.pid, timeout_ms)
+        if c == _RUNNING { return false }
+        self.code = c
+        self._finished = true
+        self._close_pipes()
+        return true
+    }
+
+    --- True once the program has finished. Doesn't wait. ---
+    define done(self) -> Bool {
+        return self.wait_for(0)
+    }
+
+    --- Send signal `sig` (15 = SIGTERM, 9 = SIGKILL, 2 = SIGINT, ...). No-op once it has finished. ---
+    define signal(self, sig: Int) -> void {
+        if not self._finished { kill_raw(self.pid, sig) }
+    }
+
+    --- Ask it to stop (SIGTERM). ---
+    define terminate(self) -> void {
+        self.signal(15)
+    }
+
+    --- Stop it now (SIGKILL) and wait for it. ---
+    define kill(self) -> void {
+        self.signal(9)
+        self.wait()
+    }
+
+    define _close_pipes(self) -> void {
+        if self._in >= 0 { close_raw(self._in) }
+        self._in = -1
+    }
+
+    define __str(self) -> String {
+        state := "running"
+        if self._finished { state = "code=" + self.code.str() }
+        return "Process(pid=" + self.pid.str() + ", " + state + ", '" + _join_args(self.args) + "')"
+    }
+}
+
+---
+Start a program and return without waiting for it.
+
+`stdin` / `stdout` / `stderr` each say where that stream goes:
+`"pipe"` (default — use `write` / `read` / `read_line` / `communicate`),
+`"inherit"` (this process's terminal), `"null"` (discard / empty input);
+`stderr="stdout"` sends stderr into the stdout pipe.
+
+Read its output to the end (or `communicate`) before `wait`ing: a
+program that fills an unread pipe stops until someone reads it.
+@throws FileNotFoundError when the program can't be found.
+@example
+p := process.spawn(["tail", "-f", "app.log"], stderr="null")
+for i in 0..5 { print(p.read_line()) }
+p.kill()
+---
+define spawn(args: List, cwd: String = "", env: Map = Map(), inherit_env: Bool = true, stdin: String = "pipe", stdout: String = "pipe", stderr: String = "pipe") -> Process {
+    r := _start(args, cwd, env, inherit_env, _mode(stdin, "stdin", false), _mode(stdout, "stdout", false), _mode(stderr, "stderr", true))
+    return Process(args, r[0], r[1], r[2], r[3])
+}
+
+---
+Run a program to completion and return its `RunResult`.
+
+`input` is sent to its stdin (otherwise stdin is this process's).
+stdout and stderr are captured unless `capture=false` (then they go to
+this process's terminal); `merge_stderr=true` captures both, interleaved,
+in `stdout`. `timeout_ms` kills it when time runs out; `check=true`
+throws `ProcessError` on a non-zero exit.
+@throws FileNotFoundError when the program can't be found.
+@example
+r := process.run(["ls", "-1"], cwd="/tmp")
+for name in r.stdout.split("\n") { print(name) }
+@example
+process.run(["make", "test"], capture=false, check=true)
+---
+define run(args: List, input: String = "", cwd: String = "", env: Map = Map(), inherit_env: Bool = true, timeout_ms: Int = -1, check: Bool = false, capture: Bool = true, merge_stderr: Bool = false) -> RunResult {
+    in_mode := 0
+    if input.length() > 0 { in_mode = 1 }
+    out_mode := 0
+    err_mode := 0
+    if capture {
+        out_mode = 1
+        err_mode = 1
+        if merge_stderr { err_mode = 3 }
+    }
+    r := _start(args, cwd, env, inherit_env, in_mode, out_mode, err_mode)
+    p := Process(args, r[0], r[1], r[2], r[3])
+    res := p.communicate(input, timeout_ms)
+    if check { res.check() }
+    return res
+}
+
+---
+`run` through the shell: `/bin/sh -c command`, so pipes, globs,
+redirects and `$VARS` work. Only for commands you wrote — never paste
+untrusted input into one (use `run` with an args List instead).
+@example
+r := process.shell("ls *.qk | wc -l")
+print(r.stdout.trim())
+---
+define shell(command: String, input: String = "", cwd: String = "", env: Map = Map(), inherit_env: Bool = true, timeout_ms: Int = -1, check: Bool = false, capture: Bool = true, merge_stderr: Bool = false) -> RunResult {
+    return run(["/bin/sh", "-c", command], input, cwd, env, inherit_env, timeout_ms, check, capture, merge_stderr)
+}
+
+---
+Run a program and return its stdout, with one trailing newline removed.
+Throws `ProcessError` when it exits with a non-zero code.
+@example
+sha := process.output(["git", "rev-parse", "HEAD"])
+---
+define output(args: List, cwd: String = "", env: Map = Map(), timeout_ms: Int = -1) -> String {
+    r := run(args, "", cwd, env, true, timeout_ms, true, true, false)
+    out := r.stdout
+    if out.endswith("\r\n") { return out.substring(0, out.length() - 2) }
+    if out.endswith("\n") { return out.substring(0, out.length() - 1) }
+    return out
+}
