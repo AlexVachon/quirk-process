@@ -55,6 +55,7 @@ from typing.primitives.string use { String }
 from typing.collections.list use { List }
 from typing.collections.map use { Map }
 from typing.exceptions.types use { IOError, FileNotFoundError, RuntimeError, ValueError }
+use sys
 
 extern define spawn_raw(argv: List, cwd: String, env: List, inherit_env: Int, in_mode: Int, out_mode: Int, err_mode: Int) -> List
 extern define strerror(err: Int) -> String
@@ -397,15 +398,17 @@ define run(args: List, input: String = "", cwd: String = "", env: Map = Map(), i
 }
 
 ---
-`run` through the shell: `/bin/sh -c command`, so pipes, globs,
-redirects and `$VARS` work. Only for commands you wrote — never paste
+`run` through the shell — `/bin/sh -c command` (Windows: `cmd.exe /c`),
+so pipes, globs, redirects and variables work. Only for commands you wrote — never paste
 untrusted input into one (use `run` with an args List instead).
 @example
 r := process.shell("ls *.qk | wc -l")
 print(r.stdout.trim())
 ---
 define shell(command: String, input: String = "", cwd: String = "", env: Map = Map(), inherit_env: Bool = true, timeout_ms: Int = -1, check: Bool = false, capture: Bool = true, merge_stderr: Bool = false) -> RunResult {
-    return run(["/bin/sh", "-c", command], input, cwd, env, inherit_env, timeout_ms, check, capture, merge_stderr)
+    argv := ["/bin/sh", "-c", command]
+    if sys.platform() == "win32" { argv = ["cmd.exe", "/d", "/s", "/c", command] }
+    return run(argv, input, cwd, env, inherit_env, timeout_ms, check, capture, merge_stderr)
 }
 
 ---

@@ -45,16 +45,16 @@ A program that can't be found throws `FileNotFoundError`. Inside an
 `async` task, waits let the other tasks run, and `task.cancel()` kills the
 program and raises `CancelledError`.
 
-Needs the Quirk compiler 7.18.0+ (the `Process_*` runtime). Bundled with
+Needs the Quirk compiler 7.24.0+ (the `Process_*` runtime). Bundled with
 the compiler at `<QUIRK_HOME>/packages/process/`, so `use process` works
 out of the box; this repo is its canonical home:
 
 ```bash
 quirk install process            # latest tag from this repo
-quirk install process@1.0.1      # pinned
+quirk install process@1.0.2      # pinned
 ```
 
-POSIX only (Linux, macOS) for now.
+Linux, macOS and (with the native Windows build) Windows, where `process.shell` uses `cmd.exe /c`.
 
 ## License
 
